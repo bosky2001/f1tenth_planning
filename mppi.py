@@ -4,6 +4,7 @@ from f1tenth_planning.utils.utils import nearest_point
 from dataclasses import dataclass, field
 import numpy as np
 import math
+from functools import partial
 
 @dataclass
 class mppi_config:
@@ -73,11 +74,18 @@ class MPPIPlanner:
         self.drawn_waypoints = []
 
         # MPPI weights stuff
+        self.initial_state = None
         self.damping = 0.01
         self.temperature = 0.01
         self.sigma = np.diag([0.1, 1.5])  # steering, acceleration
         self.mean = np.array([0.0, 2.0])
-        self.sampled_trajs = np.zeros((self.config.TK, 4))
+        self.sampled_trajs = np.zeros((self.samples, self.config.TK, 4))
+        self.key = jax.random.PRNGKey(1337)
+        self.rollouts = None
+        self.dt = self.config.DTK
+        self.u_prev = None
+        self.target_state = jnp.array([-5, -1, 0, 3.4])
+        self.Q = jnp.diag(jnp.array([1,1, 1, 100]))
     
     def render_waypoints(self, e):
         """
@@ -96,13 +104,15 @@ class MPPIPlanner:
         else:
             print("balls")
     
-    def render_sampled_plan(self, e):
+    def render_sampled_trajs(self, e):
         """
         Drawing the sampled trajectory from MPPI
         """
-        if self.sampled_trajs is not None:
-            points = self.sampled_trajs[:2].T
-            e.render_lines(points, color=(0, 128, 0), size=2)
+        if self.rollouts is not None:
+
+            for i in range(1000):
+                points = np.asarray(self.rollouts[i][:, :2])
+                e.render_lines(points, color=(0, 128, 0), size=5)
             
     def calc_ref_trajectory_kinematic(self, state, cx, cy, cyaw, sp):
         """
@@ -189,6 +199,8 @@ class MPPIPlanner:
             beta=states["beta"],
         )
 
+        # setting the initial state
+        self.initial_state = jnp.array([states["pose_x"], states["pose_y"], states["linear_vel_x"], states["pose_theta"]])
         # self.MPC_Control_kinematic(vehicle_state, self.waypoints)
 
         cx = self.waypoints[0]  # Trajectory x-Position
@@ -200,104 +212,64 @@ class MPPIPlanner:
         self.ref_path = self.calc_ref_trajectory_kinematic(
             vehicle_state, cx, cy, cyaw, sp
         )
+
         # print(self.ref_path.shape)    4 states and 9 time steps
 
-
-        x_0 = vehicle_state
-
-
-        sampled_inputs = np.random.multivariate_normal(self.mean, self.sigma, (1000, 8))
-        traj_rollout_costs = np.zeros(self.samples)
-
-        traj_rollout_control = np.zeros((self.samples, self.config.TK, 2))
-        # print(traj_rollout_control.shape)
+        # change rng key and get input samples
+        rng_da, self.key = jax.random.split(self.key)
+        sampled_inputs = jax.random.truncated_normal(rng_da, jnp.array([0, self.config.MIN_STEER]), jnp.array([self.config.MAX_ACCEL, self.config.MAX_STEER]), (1000, 8,2))
         
-        # sampling trajectories/ rollout
-        for k in range(self.samples):
-            curr_state = x_0
+        # rolling out the resulting trajectories
+        self.rollouts, cost = jax.vmap(self.iteration_vmap)(sampled_inputs)
 
-            cost = 0.0
-            for dt in range(1, self.config.TK+1):
-
-                sampled_input = sampled_inputs[k,dt-1]
-                # do rollout with input
-                curr_state = self.update_state_kinematic(curr_state, sampled_input)
-                cost += self.stage_cost(curr_state, self.ref_path[:, dt])
-                traj_rollout_control[k, dt-1] = sampled_input
-            traj_rollout_costs[k] = cost
-
-        w = self.weights(traj_rollout_costs)
-        # print(w.shape)
-
-
-        mppi_control = np.zeros((self.config.TK, 2))
-
-        for dt in range(self.config.TK):
-            for k in range(self.samples):
-                mppi_control[dt] += w[k]* traj_rollout_control[k, dt]
+        # calculating weight of the sampled inputs
+        W = jax.vmap(self.weights, 1, 1)(cost)
+        # print(W.shape)
         
-        # print(mppi_control.shape)
-        curr_state = x_0
-        self.sampled_trajs[0] = np.array([x_0.x, x_0.y, x_0.x, x_0.yaw])
-        for i in range(1, self.config.TK):
-            curr_state = self.update_state_kinematic(curr_state, mppi_control[i-1])
-            self.sampled_trajs[i] = np.array([curr_state.x, curr_state.y, curr_state.v, curr_state.yaw])
-            
-        print(self.sampled_trajs.shape)
-        self.u_prev[:-1] = mppi_control[1:]
-        self.u_prev[-1] = mppi_control[-1]
-        return mppi_control[0]
+        # taking weighted average 
+        da_opt = jax.vmap(jnp.average, (1, None, 1))(sampled_inputs, 0, W)  # [n_steps, dim_a]
+        
+        # TODO: use prev input to update sampling distribution
+        self.u_prev = da_opt
 
-    def update_state_kinematic(self, state, control):
+        accel, steerv = da_opt[0]
 
-        a = control[0]
-        delta = control[1]
-        # input check
-        if delta >= self.config.MAX_STEER:
-            delta = self.config.MAX_STEER
-        elif delta <= -self.config.MAX_STEER:
-            delta = -self.config.MAX_STEER
+        return steerv, accel
 
-        state.x = state.x + state.v * math.cos(state.yaw) * self.config.DTK
-        state.y = state.y + state.v * math.sin(state.yaw) * self.config.DTK
-        state.yaw = (
-            state.yaw + (state.v / self.config.WB) * math.tan(delta) * self.config.DTK
-        )
-        state.v = state.v + a * self.config.DTK
-
-        if state.v > self.config.MAX_SPEED:
-            state.v = self.config.MAX_SPEED
-        elif state.v < self.config.MIN_SPEED:
-            state.v = self.config.MIN_SPEED
-
-        return state
-    
-    
         
 
+    @partial(jax.jit, static_argnums=0)
+    def dynamics(self, state, control):
+        v, yaw = state[2:]
+        a, delta = control
+        # set wheelbase
+        L = 1
 
-    def stage_cost(self, state, ref_state):
-        Q = np.diag([100, 100, 100, 10])
-
-        cost = 0.0
-
-        xt = np.array([state.x, state.y, state.v, state.yaw])
-        cost = (xt-ref_state) @ Q @ (xt-ref_state).T
-        # print(xt - ref_state)
-        # for i in range(ref_state.shape[1]):
-        #     cost += (state-ref_state[i]) @ Q @ (state - ref_state[i])
-
-        return cost
+        state = state.at[0].add(v*jnp.cos(yaw)*self.dt)
+        state = state.at[1].add(v*jnp.sin(yaw)*self.dt)
+        state = state.at[2].add(a*self.dt)
+        state = state.at[3].add(v*jnp.tan(delta)*self.dt/L)
+        
+        delta_x = state - self.target_state # 1x4
+        cost = jnp.sum(jnp.dot(delta_x, jnp.dot(self.Q, delta_x.T)))
+        return state, (state, cost)
     
-    def terminal_cost(self, state):
+    @partial(jax.jit, static_argnums=0)
+    def iteration_vmap(self, sampled_input):
+        x_init = self.initial_state
+        x_init, (rollout, cost) = jax.lax.scan(self.dynamics,init=x_init, xs=sampled_input)
+        return rollout, cost
+    
+    def stage_cost(self, state):
         pass
     
+    @partial(jax.jit, static_argnums=0)
     def weights(self, R):  # pylint: disable=invalid-name
         # R: [n_samples]
         # R_stdzd = (R - jnp.min(R)) / ((jnp.max(R) - jnp.min(R)) + self.damping)
         # R_stdzd = R - jnp.max(R) # [n_samples] np.float32
-        R_stdzd = (R - np.max(R)) / ((np.max(R) - np.min(R)) + self.damping)  # pylint: disable=invalid-name
-        w = np.exp(R_stdzd / self.temperature)  # [n_samples] np.float32
-        w = w/np.sum(w)  # [n_samples] np.float32
+        R_stdzd = (R - jnp.max(R)) / ((jnp.max(R) - jnp.min(R)) + self.damping)  # pylint: disable=invalid-name
+        w = jnp.exp(R_stdzd / self.temperature)  # [n_samples] np.float32
+        w = w/jnp.sum(w)  # [n_samples] np.float32
         return w
     
