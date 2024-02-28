@@ -66,9 +66,9 @@ def main():
     # env.unwrapped.add_render_callback(planner.render_waypoints)
     # env.unwrapped.add_render_callback(planner.render_local_plan)
 
-    env.unwrapped.add_render_callback(testplanner.render_waypoints)
-    env.unwrapped.add_render_callback(testplanner.render_local_plan)
-    # env.unwrapped.add_render_callback(testplanner.render_sampled_trajs)
+    # env.unwrapped.add_render_callback(testplanner.render_waypoints)
+    # env.unwrapped.add_render_callback(testplanner.render_local_plan)
+    env.unwrapped.add_render_callback(testplanner.render_sampled_trajs)
     # env.unwrapped.add_render_callback(planner.render_mpc_sol)
 
     # reset environment
@@ -88,8 +88,8 @@ def main():
     laptime = 0.0
     start = time.time()
     while not done:
-        steerv, accl = planner.plan(obs["agent_0"])
-        # steerv, accl = testplanner.plan(obs["agent_0"])
+        # steerv, accl = planner.plan(obs["agent_0"])
+        steerv, accl = testplanner.plan(obs["agent_0"])
         obs, timestep, terminated, truncated, infos = env.step(
             np.array([[steerv, accl]])
         )
@@ -97,6 +97,7 @@ def main():
         laptime += timestep
         env.render()
 
+        #plot the samples at each point in matplotlib
         # print(
         #     "speed: {}, steer vel: {}, accl: {}".format(
         #         obs["agent_0"]["linear_vel_x"], steerv, accl
