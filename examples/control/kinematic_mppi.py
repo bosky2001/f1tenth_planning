@@ -20,17 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""
-STMPC waypoint tracker example
-
-Author: Hongrui Zheng
-Last Modified: 8/1/22
-"""
-
 import numpy as np
 import gym
 
-from f1tenth_planning.control.kinematic_mpc.kinematic_mpc import KMPCPlanner
 from f1tenth_planning.control.kinematic_mppi.kinematic_mppi import MPPIPlanner
 
 def main():
@@ -41,14 +33,11 @@ def main():
 
     # loading waypoints
     waypoints = np.loadtxt('./levine_centerline.csv', delimiter=';', skiprows=3)
-    print(waypoints.shape)
     # [x, y, yaw, v]
-    mpc_line = [waypoints[:, 1], waypoints[:, 2], waypoints[:, 3], waypoints[:, 5]]
-    planner = KMPCPlanner(waypoints=mpc_line)
+    # mpc_line = [waypoints[:, 1], waypoints[:, 2], waypoints[:, 3], waypoints[:, 5]]
+    planner = MPPIPlanner(waypoints=waypoints)
 
     # create environment
-    testing = MPPIPlanner(waypoints=waypoints)
-
     env = gym.make('f110_gym:f110-v0', map='./levine_slam', map_ext='.pgm', num_agents=1)
     obs, _, done, _ = env.reset(np.array([[2.51, 3.29, 1.58]]))
 
@@ -57,9 +46,7 @@ def main():
     while not done:
         if up_to_speed:
             steer, speed = planner.plan(env.sim.agents[0].state)
-
-            # steer, speed = testing.plan(env.sim.agents[0].state)
-
+            
             obs, timestep, done, _ = env.step(np.array([[steer, speed]]))
             laptime += timestep
             env.render(mode='human')
