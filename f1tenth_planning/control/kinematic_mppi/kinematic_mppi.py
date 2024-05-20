@@ -97,22 +97,30 @@ class MPPI():
             a_cov = None
         return (a_opt, a_cov)
 
-    def update(self, mpc_state, env, env_state, rng, da):
+    def update(self, mpc_state, env, env_state, rng):
         # mpc_state: ([n_steps, dim_a], [n_steps, dim_a, dim_a])
         # env: {.step(s, a), .reward(s)}
         # env_state: [env_shape] np.float32
         # rng: rng key for mpc sampling
-        # dat: sampled perturbations 
+
         dim_a = jnp.prod(env.a_shape)  # np.int32
         a_opt, a_cov = mpc_state
         a_opt = jnp.concatenate([a_opt[1:, :],
                                 jnp.expand_dims(jnp.zeros((dim_a,)),
                                                 axis=0)])  # [n_steps, dim_a]
 
+        
         def iteration_step(input_, _):
-            a_opt, a_cov, rng, da = input_
+            a_opt, a_cov, rng = input_
             rng_da, rng = jax.random.split(rng)
 
+            
+            da = jax.random.truncated_normal(
+                rng_da,
+                -jnp.ones_like(a_opt) - a_opt,
+                jnp.ones_like(a_opt) - a_opt,
+                shape=(self.n_samples, self.n_steps, 2)
+            )
             a = jnp.clip(jnp.expand_dims(a_opt, axis=0) + da, -1.0, 1.0)
             # print('up', env_state.shape)
             r_sample, s, ret_dyna = jax.vmap(self.rollout, in_axes=(0, None, None))(
@@ -137,7 +145,7 @@ class MPPI():
         predicted_states = []
         if not self.scan:
             for _ in range(self.n_iterations):
-                (a_opt, a_cov, s, s_opt, rng, r_sample, a, ret_dyna), _ = iteration_step((a_opt, a_cov, rng, da), None)
+                (a_opt, a_cov, s, s_opt, rng, r_sample, a, ret_dyna), _ = iteration_step((a_opt, a_cov, rng), None)
                 predicted_states.append(s)
         else:
             (a_opt, a_cov, rng), _ = jax.lax.scan(
@@ -170,12 +178,7 @@ class MPPI():
         # actions: [n_steps, dim_a]
         # env: {.step(s, a), .reward(s)}
         # env_state: np.float32
-        # reward_fn: reward_fn(env, s, params, rng)
-        # reward_params: params for reward function
-        # reward_rng: rng key for reward function stochasticity, e.g. dropout
-        # a: # a_0, ..., a_{n_steps}. [n_steps, dim_a]
-        # s: # s_1, ..., s_{n_steps+1}. [n_steps, env_state_shape]
-        # r: # r_1, ..., r_{n_steps+1}. [n_steps]
+
     
         def rollout_step(env_state, a):
             a = jnp.reshape(a, env.a_shape)
@@ -202,8 +205,6 @@ class oneLineJaxRNG:
     def new_key(self):
         self.rng, key = jax.random.split(self.rng)
         return key
-
-jRNG = oneLineJaxRNG(1337)
 
 
 
@@ -586,11 +587,11 @@ class MPPIPlanner():
         self.debug = debug
         self.n_steps = 8
         self.n_samples = 128
-        self.jRNG = jRNG
+        self.jRNG = oneLineJaxRNG(1337)
         self.DT = 0.1
         self.mppi_env_ks = MPPIEnv(self.track, self.n_steps, mode = 'ks', DT= self.DT)
         self.mppi_env_st = MPPIEnv(self.track, self.n_steps, mode = 'st', DT= self.DT)
-        self.mppi = MPPI(n_iterations = 1, n_steps = self.n_steps,
+        self.mppi = MPPI(n_iterations = 5, n_steps = self.n_steps,
                          n_samples = self.n_samples, a_noise = 1.0, scan = False)
         
         self.a_opt = None
@@ -616,16 +617,6 @@ class MPPIPlanner():
 
     def init_mppi_compile(self):
 
-        a_opt = self.a_opt
-        da = jax.random.truncated_normal(
-            self.jRNG.new_key(),
-            -jnp.ones_like(a_opt) - a_opt,
-            jnp.ones_like(a_opt) - a_opt,
-            shape=(self.n_samples, self.n_steps, 2)
-        )
-        # env.track.raceline.xs[0],
-        #         env.track.raceline.ys[0],
-        #         env.track.raceline.yaws[0],
 
         init_x = self.track.raceline.xs[0]
         init_y = self.track.raceline.ys[0]
@@ -634,13 +625,13 @@ class MPPIPlanner():
         state_ks = np.array([init_x, init_y, 0, 0, init_yaw], dtype=np.float32)
 
         _,_ = self.mppi_env_ks.get_refernece_traj(state_ks, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
-        _, _, _, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_ks, state_ks.copy(), self.jRNG.new_key(), da)
+        _, _, _, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_ks, state_ks.copy(), self.jRNG.new_key())
         
         
         state_st = np.array([init_x, init_y, 0, 0, init_yaw, 0, 0], dtype=np.float32)
 
         _,_ = self.mppi_env_st.get_refernece_traj(state_st, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
-        _, _, _, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_st, state_st.copy(), self.jRNG.new_key(), da)
+        _, _, _, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_st, state_st.copy(), self.jRNG.new_key())
 
     def render_waypoints(self, e):
         """
@@ -669,31 +660,31 @@ class MPPIPlanner():
 
     def render_mppi_sol(self, e):
         """
-        Callback to render the lookahead point.
+        Callback to render the mppi sol.
         """
         if self.mppi_path is not None:
             opt_path = np.array(self.mppi_path)
             e.render_lines(opt_path[:, :2], color=(0, 0, 128), size=2)
 
     def plan(self, obs):
+        """
+        Planner plan function for MPPI, returns acutation based on current state
 
-        
-        
-        self.a_opt = jnp.concatenate([self.a_opt[1:, :],
-                    jnp.expand_dims(jnp.zeros((2,)),
-                                    axis=0)])  # [n_steps, dim_a]
+        Args:
+            pose_x (float): current vehicle x position
+            pose_y (float): current vehicle y position
+            delta (float): current vehicle steering angle
+            linear_vel_x (float): current vehicle velocity
+            pose_theta (float): current vehicle heading angle
+            ang_vel_z (float): current vehicle yawrate
+            beta (float): current vehicle sideslip angle
+            
 
-        a_opt = self.a_opt.copy()
-
-        # TODO: change mppi class to directly sample perturbations instead of feeding it to update
-        da = jax.random.truncated_normal(
-            self.jRNG.new_key(),
-            -jnp.ones_like(a_opt) - a_opt,
-            jnp.ones_like(a_opt) - a_opt,
-            shape=(self.n_samples, self.n_steps, 2)
-        )
-
-
+        Returns:
+            steering_rate (float):  commanded vehicle steering rate
+            accl (float): commanded vehicle acceleration
+        """
+         
         state_x = obs['pose_x']
         state_y = obs['pose_y']
         delta = obs['delta']
@@ -707,7 +698,7 @@ class MPPIPlanner():
 
             ref_traj,_ = self.mppi_env_ks.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
             self.ref_path = ref_traj
-            self.mppi_state, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_ks, state.copy(), self.jRNG.new_key(), da)
+            self.mppi_state, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_ks, state.copy(), self.jRNG.new_key())
         
         else:
             state = np.array([state_x, state_y, delta, v, yaw, yawrate, beta])
@@ -715,7 +706,7 @@ class MPPIPlanner():
             ref_traj,_ = self.mppi_env_st.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
             self.ref_path = ref_traj
             # s_opt = None
-            self.mppi_state, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_st, state.copy(), self.jRNG.new_key(), da)
+            self.mppi_state, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_st, state.copy(), self.jRNG.new_key())
 
 
         self.mppi_path = s_opt
