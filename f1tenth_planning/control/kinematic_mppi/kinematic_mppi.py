@@ -223,7 +223,7 @@ param1 = {
         # longitudinal constraints
         'v_min': -13.9,  # minimum velocity [m/s]
         'v_max': 45.8,  # minimum velocity [m/s]
-        'v_switch': 4.755,  # switching velocity [m/s]
+        'v_switch': 3.0,  # switching velocity [m/s]
         'a_max': 3.5,  # maximum absolute acceleration [m/s^2]
 
         # masses
@@ -417,8 +417,8 @@ class MPPIEnv():
             x[3]/lwb*jnp.tan(x[2])])
         return f
     
-    def vehicle_dynamics_st(self, x, u_init, mu=1, C_Sf=20.898, C_Sr=20.898, 
-                        lf=0.88392, lr=1.50876, h=0.59436, m=1225.887, I=1538.853371):
+    def vehicle_dynamics_st(self, x, u_init, mu=1.0489, C_Sf=4.718, C_Sr=5.4562, 
+                        lf=0.15875, lr=0.17145, h=0.074, m=3.74, I=0.04712):
         """
         Single Track Dynamic Vehicle Dynamics.
 
@@ -477,7 +477,7 @@ class MPPIEnv():
         # return self.update_fn(x, u)
     
     
-    # @partial(jax.jit, static_argnums=(0,))
+    @partial(jax.jit, static_argnums=(0,))
     def reward_fn(self, s, reference):
         
 
@@ -486,7 +486,9 @@ class MPPIEnv():
         yaw_cost = -jnp.abs(jnp.sin(reference[1:, 3]) - jnp.sin(s[:, 4])) - \
             jnp.abs(jnp.cos(reference[1:, 3]) - jnp.cos(s[:, 4]))
         
-        return 2*xy_cost + 7.5*yaw_cost  
+        # adding terminal cost( useful sometimes)
+        terminal_cost = -jnp.linalg.norm(reference[-1, :2] - s[-1, :2])
+        return 15*xy_cost + 20*yaw_cost  
             
     
     # @partial(jax.jit, static_argnums=(0,))
@@ -582,12 +584,12 @@ class MPPIPlanner():
     ):
         self.track = track
         self.debug = debug
-        self.n_steps = 12
+        self.n_steps = 8
         self.n_samples = 128
         self.jRNG = jRNG
         self.DT = 0.1
-
-        self.mppi_env = MPPIEnv(self.track, self.n_steps, mode = 'ks', DT= self.DT)
+        self.mppi_env_ks = MPPIEnv(self.track, self.n_steps, mode = 'ks', DT= self.DT)
+        self.mppi_env_st = MPPIEnv(self.track, self.n_steps, mode = 'st', DT= self.DT)
         self.mppi = MPPI(n_iterations = 1, n_steps = self.n_steps,
                          n_samples = self.n_samples, a_noise = 1.0, scan = False)
         
@@ -596,19 +598,49 @@ class MPPIPlanner():
         self.mppi_state = None
         
         self.mppi_path = None
-        self.target_vel = 3.0
+        self.target_vel = 5.0
         config_norm_params = jnp.array(config.normalization_param[7:9])
 
         self.norm_param = config_norm_params[:, 0]/2
         self.init_state()
         self.ref_path = None
         self.laptime = 0
+
+        self.init_mppi_compile()
         
     
     def init_state(self):
-        self.mppi_state =  self.mppi.init_state(self.mppi_env.a_shape, self.jRNG.new_key() )
+        self.mppi_state =  self.mppi.init_state(self.mppi_env_ks.a_shape, self.jRNG.new_key() )
         self.a_opt = self.mppi_state[0]
     
+
+    def init_mppi_compile(self):
+
+        a_opt = self.a_opt
+        da = jax.random.truncated_normal(
+            self.jRNG.new_key(),
+            -jnp.ones_like(a_opt) - a_opt,
+            jnp.ones_like(a_opt) - a_opt,
+            shape=(self.n_samples, self.n_steps, 2)
+        )
+        # env.track.raceline.xs[0],
+        #         env.track.raceline.ys[0],
+        #         env.track.raceline.yaws[0],
+
+        init_x = self.track.raceline.xs[0]
+        init_y = self.track.raceline.ys[0]
+        init_yaw = self.track.raceline.yaws[0]
+
+        state_ks = np.array([init_x, init_y, 0, 0, init_yaw], dtype=np.float32)
+
+        _,_ = self.mppi_env_ks.get_refernece_traj(state_ks, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
+        _, _, _, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_ks, state_ks.copy(), self.jRNG.new_key(), da)
+        
+        
+        state_st = np.array([init_x, init_y, 0, 0, init_yaw, 0, 0], dtype=np.float32)
+
+        _,_ = self.mppi_env_st.get_refernece_traj(state_st, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
+        _, _, _, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_st, state_st.copy(), self.jRNG.new_key(), da)
 
     def render_waypoints(self, e):
         """
@@ -670,20 +702,24 @@ class MPPIPlanner():
         yawrate = obs['ang_vel_z']
         beta = obs['beta']
 
-        state = np.array([state_x, state_y, delta, v, yaw])
-        # state = np.array([state_x, state_y, delta, v, yaw, yawrate, beta])
+        if v < params[8]:
+            state = np.array([state_x, state_y, delta, v, yaw])
 
-        ref_traj,_ = self.mppi_env.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
-        self.ref_path = ref_traj
-        # print(ref_traj) #[n_steps + 1, 7]
+            ref_traj,_ = self.mppi_env_ks.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
+            self.ref_path = ref_traj
+            self.mppi_state, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_ks, state.copy(), self.jRNG.new_key(), da)
+        
+        else:
+            state = np.array([state_x, state_y, delta, v, yaw, yawrate, beta])
 
-        # TODO: only get a_opt and not the (a_opt, a_cov) by calling it directly from mppi class
-        # sampled_traj = None
-        self.mppi_state, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env, state.copy(), self.jRNG.new_key(), da)
+            ref_traj,_ = self.mppi_env_st.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
+            self.ref_path = ref_traj
+            # s_opt = None
+            self.mppi_state, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_st, state.copy(), self.jRNG.new_key(), da)
+
 
         self.mppi_path = s_opt
-        # print(s_opt.shape)
-        # # print(sampled_traj.shape)
+        # print(s_opt.shape
 
         if self.debug:
             # plots sampled trajectories every 40 steps
@@ -700,7 +736,7 @@ class MPPIPlanner():
         steerv = scaled_control[0]
         accl = scaled_control[1]
 
-        if obs["linear_vel_x"] < 0.5:
+        if obs["linear_vel_x"] < 0.1:
             steer, accl = 0.0, 3.0
             return steer, accl
         # return sampled_traj
