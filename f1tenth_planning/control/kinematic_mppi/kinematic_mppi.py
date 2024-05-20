@@ -591,14 +591,15 @@ class MPPIPlanner():
         self.DT = 0.1
         self.mppi_env_ks = MPPIEnv(self.track, self.n_steps, mode = 'ks', DT= self.DT)
         self.mppi_env_st = MPPIEnv(self.track, self.n_steps, mode = 'st', DT= self.DT)
-        self.mppi = MPPI(n_iterations = 5, n_steps = self.n_steps,
+        self.mppi = MPPI(n_iterations = 1, n_steps = self.n_steps,
                          n_samples = self.n_samples, a_noise = 1.0, scan = False)
         
         self.a_opt = None
         self.a_cov = None
-        self.mppi_state = None
+        self.mppi_distrib = None
         
         self.mppi_path = None
+        self.mppi_samples = None
         self.target_vel = 5.0
         config_norm_params = jnp.array(config.normalization_param[7:9])
 
@@ -611,8 +612,8 @@ class MPPIPlanner():
         
     
     def init_state(self):
-        self.mppi_state =  self.mppi.init_state(self.mppi_env_ks.a_shape, self.jRNG.new_key() )
-        self.a_opt = self.mppi_state[0]
+        self.mppi_distrib =  self.mppi.init_state(self.mppi_env_ks.a_shape, self.jRNG.new_key() )
+        self.a_opt = self.mppi_distrib[0]
     
 
     def init_mppi_compile(self):
@@ -625,13 +626,13 @@ class MPPIPlanner():
         state_ks = np.array([init_x, init_y, 0, 0, init_yaw], dtype=np.float32)
 
         _,_ = self.mppi_env_ks.get_refernece_traj(state_ks, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
-        _, _, _, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_ks, state_ks.copy(), self.jRNG.new_key())
+        _, _, _, _, _,_ = self.mppi.update(self.mppi_distrib, self.mppi_env_ks, state_ks.copy(), self.jRNG.new_key())
         
         
         state_st = np.array([init_x, init_y, 0, 0, init_yaw, 0, 0], dtype=np.float32)
 
         _,_ = self.mppi_env_st.get_refernece_traj(state_st, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
-        _, _, _, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_st, state_st.copy(), self.jRNG.new_key())
+        _, _, _, _, _,_ = self.mppi.update(self.mppi_distrib, self.mppi_env_st, state_st.copy(), self.jRNG.new_key())
 
     def render_waypoints(self, e):
         """
@@ -665,6 +666,13 @@ class MPPIPlanner():
         if self.mppi_path is not None:
             opt_path = np.array(self.mppi_path)
             e.render_lines(opt_path[:, :2], color=(0, 0, 128), size=2)
+    
+    def render_mppi_samples(self, e):
+
+        if self.mppi_samples is not None:
+            for i in range(self.n_samples):
+                sampled_path = np.array(self.mppi_samples[i])
+                e.render_lines(sampled_path[:, :2], color=(128, 128, 0), size=2)
 
     def plan(self, obs):
         """
@@ -698,7 +706,7 @@ class MPPIPlanner():
 
             ref_traj,_ = self.mppi_env_ks.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
             self.ref_path = ref_traj
-            self.mppi_state, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_ks, state.copy(), self.jRNG.new_key())
+            self.mppi_distrib, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_distrib, self.mppi_env_ks, state.copy(), self.jRNG.new_key())
         
         else:
             state = np.array([state_x, state_y, delta, v, yaw, yawrate, beta])
@@ -706,10 +714,11 @@ class MPPIPlanner():
             ref_traj,_ = self.mppi_env_st.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
             self.ref_path = ref_traj
             # s_opt = None
-            self.mppi_state, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_state, self.mppi_env_st, state.copy(), self.jRNG.new_key())
+            self.mppi_distrib, sampled_traj, s_opt, _, _,_ = self.mppi.update(self.mppi_distrib, self.mppi_env_st, state.copy(), self.jRNG.new_key())
 
 
         self.mppi_path = s_opt
+        self.mppi_samples = sampled_traj[0]
         # print(s_opt.shape
 
         if self.debug:
@@ -720,7 +729,7 @@ class MPPIPlanner():
                 plt.show()
 
         self.laptime+=1
-        a_opt = self.mppi_state[0]
+        a_opt = self.mppi_distrib[0]
         control = a_opt[0]
         scaled_control = np.multiply(self.norm_param, control)
 
