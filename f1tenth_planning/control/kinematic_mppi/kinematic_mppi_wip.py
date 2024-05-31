@@ -14,7 +14,6 @@ from functools import partial
 import yaml
 from pathlib import Path
 
-
 class ConfigYAML():
     """
     Config class for yaml file
@@ -51,53 +50,45 @@ class Config(ConfigYAML):
     # init_noise = [5e-3, 5e-3, 5e-3] # control_vel, control_steering, state 
     init_noise = [0, 0, 0] # control_vel, control_steering, state
 
-class oneLineJaxRNG:
-    def __init__(self, init_num=0) -> None:
-        self.rng = jax.random.PRNGKey(init_num)
-        
-    def new_key(self):
-        self.rng, key = jax.random.split(self.rng)
-        return key
-    
+
 class MPPI():
     """An MPPI based planner."""
-    def __init__(self, config, jRNG, temperature=0.01,
-                damping=0.001, a_noise=0.5, scan=False):
+    def __init__(self, config, env, jrng, 
+                 temperature=0.01, damping=0.001):
         self.config = config
-        self.jRNG = jRNG
         self.n_iterations = config.n_iterations
         self.n_steps = config.n_steps
         self.n_samples = config.n_samples
         self.temperature = temperature
         self.damping = damping
-        self.a_std = a_noise
-        self.scan = scan  # whether to use jax.lax.scan instead of python loop
-
+        self.a_std = jnp.array(config.control_sample_noise)
+        self.scan = False  # whether to use jax.lax.scan instead of python loop
         self.adaptive_covariance = config.adaptive_covariance
         self.a_shape = config.control_dim
+        self.env = env
+        self.jrng = jrng
+        self.init_state(self.env, self.a_shape)
         self.accum_matrix = jnp.triu(jnp.ones((self.n_steps, self.n_steps)))
 
-    def init_state(self, a_shape):
+    def init_state(self, env, a_shape):
         # uses random as a hack to support vmap
         # we should find a non-hack approach to initializing the state
-        self.dim_a = jnp.prod(a_shape)  # np.int32
-        a_opt = 0.0*jax.random.uniform(self.jRNG.new_key(), shape=(self.n_steps,
-                                                self.dim_a))  # [n_steps, dim_a]
+        dim_a = jnp.prod(a_shape)  # np.int32
+        self.env = env
+        self.a_opt = 0.0*jax.random.uniform(self.jrng.new_key(), shape=(self.n_steps,
+                                                dim_a))  # [n_steps, dim_a]
         # a_cov: [n_steps, dim_a, dim_a]
         if self.adaptive_covariance:
             # note: should probably store factorized cov,
             # e.g. cholesky, for faster sampling
-            a_cov = (self.a_std**2)*jnp.tile(jnp.eye(self.dim_a), (self.n_steps, 1, 1))
+            self.a_cov = (self.a_std**2)*jnp.tile(jnp.eye(dim_a), (self.n_steps, 1, 1))
+            self.a_cov_init = self.a_cov.copy()
         else:
-            a_cov = None
-        
-        self.a_opt = a_opt
-        self.a_cov = a_cov
-        # return (a_opt, a_cov)
+            self.a_cov = None
+            self.a_cov_init = self.a_cov
     
-
-    @partial(jax.jit, static_argnums=(0, 1))
-    def iteration_step(self, env, a_opt, a_cov, rng_da, env_state, reference_traj):
+    @partial(jax.jit, static_argnums=(0))
+    def iteration_step(self, a_opt, a_cov, rng_da, env_state, reference_traj):
         self.a_opt = jnp.concatenate([self.a_opt[1:, :],
                                 jnp.expand_dims(jnp.zeros((self.a_shape,)),
                                                 axis=0)])  # [n_steps, a_shape]
@@ -117,7 +108,7 @@ class MPPI():
         _, states = jax.vmap(self.rollout, in_axes=(0, None))(
             actions, env_state
         )
-        reward = jax.vmap(env.reward_fn, in_axes=(0, None))(
+        reward = jax.vmap(self.env.reward_fn, in_axes=(0, None))(
             states, reference_traj
         ) # [n_samples, n_steps]
         
@@ -128,85 +119,20 @@ class MPPI():
         return a_opt, a_cov, states
 
 
-    @partial(jax.jit, static_argnums=(0, 1))
-    def get_a_opt(self, env, a_opt, reference, s, da):
-        r = jax.vmap(env.reward_fn, in_axes=(0, None))(
-                s, reference
-            ) # [n_samples, n_steps]
-            
-        R = jax.vmap(self.returns)(r) # [n_samples, n_steps], pylint: disable=invalid-name
-        w = jax.vmap(self.weights, 1, 1)(R)  # [n_samples, n_steps]
-        da_opt = jax.vmap(jnp.average, (1, None, 1))(da, 0, w)  # [n_steps, dim_a]
-        a_opt = jnp.clip(a_opt + da_opt, -1.0, 1.0)  # [n_steps, dim_a]
-        return a_opt
-
-    @partial(jax.jit, static_argnums=(0))
-    def get_samples(self, env_state, a_opt, rng):
-        da = jax.random.truncated_normal(
-                rng,
-                -jnp.ones_like(a_opt) - a_opt,
-                jnp.ones_like(a_opt) - a_opt,
-                shape=(self.n_samples, self.n_steps, 2)
-            )
-        a = jnp.clip(jnp.expand_dims(a_opt, axis=0) + da, -1.0, 1.0)
-        # print('up', env_state.shape)
-
-
-        _, s = jax.vmap(self.rollout, in_axes=(0, None))(
-            a, env_state
-        )
-        return s, da
-
-    @partial(jax.jit, static_argnums=(0, 1))
-    def iter_step(self, env, env_state, a_opt, a_cov, rng, reference_traj):
-        
-        s, da= self.get_samples(env_state, a_opt, rng)
-        # print(s.shape)
-
-        a_opt = self.get_a_opt(env, a_opt, reference_traj, s, da)
-
-
-        
-        _, s_opt = self.rollout(a_opt, env_state)
-            
-        return (a_opt, a_cov, s, s_opt)
-
-    def update(self, env, env_state):
-        # mpc_state: ([n_steps, dim_a], [n_steps, dim_a, dim_a])
-        # env: {.step(s, a), .reward(s)}
-        # env_state: [env_shape] np.float32
-        # rng: rng key for mpc sampling
-
-        self.env = env
-        # a_opt, a_cov = mpc_state
-        self.a_opt = jnp.concatenate([self.a_opt[1:, :],
-                                jnp.expand_dims(jnp.zeros((self.dim_a,)),
-                                                axis=0)])  # [n_steps, dim_a]
-
-        a_opt = self.a_opt
-        a_cov = self.a_cov
-        rng = self.jRNG.new_key()
-
+    def update(self, env_state, reference_traj):
         for _ in range(self.n_iterations):
-            # (a_opt, a_cov, s, s_opt), _ = iteration_step((a_opt, a_cov, rng), None)
-            # self.a_opt, self.a_cov, s= self.iteration_step(env, self.a_opt, self.a_cov, rng, env_state, env.reference)
-            (a_opt, a_cov, s, s_opt) = self.iter_step(env, env_state, a_opt, a_cov, rng, env.reference)
-
-            # predicted_states.append(s)
-
-        return (a_opt, a_cov), s, s_opt
-
-
-    def get_action(self, mpc_state, a_shape):
-        a_opt, _ = mpc_state
-        return jnp.reshape(a_opt[0, :], a_shape)
+            self.a_opt, self.a_cov, self.states = self.iteration_step(self.a_opt, self.a_cov, self.jrng.new_key(), env_state, reference_traj)
+            if self.config.render:
+                _, self.s_opt = self.rollout(self.a_opt, env_state)
+            else:
+                self.s_opt = self.states[0]
+        self.sampled_states = self.states
 
 
     @partial(jax.jit, static_argnums=(0))
     def returns(self, r):
         # r: [n_steps]
         return jnp.dot(self.accum_matrix, r)  # R: [n_steps]
-
 
     @partial(jax.jit, static_argnums=(0))
     def weights(self, R):  # pylint: disable=invalid-name
@@ -218,35 +144,45 @@ class MPPI():
         w = w/jnp.sum(w)  # [n_samples] np.float32
         return w
     
-
-    @partial(jax.jit, static_argnums=(0))
+    @partial(jax.jit, static_argnums=0)
     def rollout(self, actions, env_state):
-        # actions: [n_steps, dim_a]
-        # env: {.step(s, a), .reward(s)}
+        """
+        # actions: [n_steps, a_shape]
+        # env: {.step(states, actions), .reward(states)}
         # env_state: np.float32
-
+        # actions: # a_0, ..., a_{n_steps}. [n_steps, a_shape]
+        # states: # s_1, ..., s_{n_steps+1}. [n_steps, env_state_shape]
+        """
+    
         def rollout_step(env_state, actions):
             actions = jnp.reshape(actions, self.env.a_shape)
             (env_state, env_var, mb_dyna) = self.env.step(env_state, actions)
             reward = self.env.reward(env_state)
             return env_state, (env_state, reward)
-
+        # if not self.scan:
+        #     # python equivalent of lax.scan (faster without scan)
         scan_output = []
         for t in range(self.n_steps):
             env_state, output = rollout_step(env_state, actions[t, :])
             scan_output.append(output)
         states, reward = jax.tree_util.tree_map(lambda *x: jnp.stack(x), *scan_output)
-   
+        # else:
+        #     _, (s, r) = jax.lax.scan(rollout_step, env_state, actions)
+            
         return reward, states
-
-
-
-
-
+    
+class oneLineJaxRNG:
+    def __init__(self, init_num=0) -> None:
+        self.rng = jax.random.PRNGKey(init_num)
+        
+    def new_key(self):
+        self.rng, key = jax.random.split(self.rng)
+        return key
 
 
 class MPPIEnv():
-    def __init__(self, track, n_steps, mode='st', DT=0.1, env_config=None, norm_param = None) -> None:
+    def __init__(self, track, n_steps, normalization_param, mode='st', DT=0.1, env_config=None,
+                 dyna_model=None, jrng=None) -> None:
         self.a_shape = 2
 
         waypoints = [
@@ -259,22 +195,16 @@ class MPPIEnv():
             track.raceline.axs
         ]
         self.waypoints = np.array(waypoints).T
-        # self.frenet_coord = FrenetCoord(jnp.array(waypoints))
-        # self.diff = self.waypoints[1:, 1:3] - self.waypoints[:-1, 1:3]
+
+        self.diff = self.waypoints[1:, 1:3] - self.waypoints[:-1, 1:3]
         self.waypoints_distances = np.linalg.norm(self.waypoints[1:, (1, 2)] - self.waypoints[:-1, (1, 2)], axis=1)
-        # print(self.waypoints_distances)
         self.n_steps = n_steps
         self.reference = None
         self.DT = DT
-        self.dlk = self.waypoints[1,0] - self.waypoints[0, 0]
-
-        # config.load_file(config.savedir + 'config.json')
-        # config_norm_params = jnp.array(config.normalization_param[7:9])
-
-        self.normalization_param = norm_param
-        self.mode = mode
+        
         self.env_config = env_config
-
+        self.normalization_param = normalization_param
+        self.mode = mode
         # self.mb_dyna_pre = None
         if mode == 'ks':
             def update_fn(x, u):
@@ -488,31 +418,67 @@ class MPPIEnv():
                 +mu/(x[3]*(lr+lf))*(C_Sf*(g*lr-u[1]*h))*x[2]])
 
         return f
-                
+      
     # @partial(jax.jit, static_argnums=(0,))
     def step(self, x, u):
-        return self.update_fn(x, u * self.normalization_param)
+        return self.update_fn(x, u * self.normalization_param[0, 7:9]/2)
         # return self.update_fn(x, u)
     
     
     @partial(jax.jit, static_argnums=(0,))
     def reward_fn(self, s, reference):
+        """
+        reward function for the state s with respect to the reference trajectory
+        """
+        # gamma = 0.8
+        # gamma_vec = jnp.array([gamma ** i for i in range(reference.shape[0] - 1)])
+        xy_cost = -jnp.linalg.norm(reference[1:, :2] - s[:, :2], ord=1, axis=1)
+        vel_cost = -jnp.linalg.norm(reference[1:, 3] - s[:, 3])
+        yaw_cost = -jnp.abs(jnp.sin(reference[1:, 4]) - jnp.sin(s[:, 4])) - \
+            jnp.abs(jnp.cos(reference[1:, 4]) - jnp.cos(s[:, 4]))
         
 
-        xy_cost = -jnp.linalg.norm(reference[1:, :2] - s[:, :2], ord=1, axis=1)
-        # vel_cost = -jnp.linalg.norm(reference[1:, 5] - s[:, 3])
-        yaw_cost = -jnp.abs(jnp.sin(reference[1:, 3]) - jnp.sin(s[:, 4])) - \
-            jnp.abs(jnp.cos(reference[1:, 3]) - jnp.cos(s[:, 4]))
-        
-        # adding terminal cost( useful sometimes)
+        # terminal cost
         terminal_cost = -jnp.linalg.norm(reference[-1, :2] - s[-1, :2])
         return xy_cost
-        return 15*xy_cost + 20*yaw_cost  
-            
+        return 15*xy_cost  + 50*terminal_cost+ 25*yaw_cost
     
     # @partial(jax.jit, static_argnums=(0,))
     def reward(self, x):
         return 0
+    
+    def get_refernece_traj_sequential(self, state, steps=10, waypoints=None, DT=0.05):
+        if waypoints is None:
+            waypoints = self.waypoints
+        _, dist, _, _, ind = nearest_point(np.array([state[0], state[1]]), 
+                                           waypoints[:, (0, 1)].copy())
+        
+        
+        interval = 5
+        inds = np.arange(ind, ind + interval * steps + 1, interval)
+        inds[np.where(inds >= waypoints.shape[0])] -= waypoints.shape[0]
+        reference = waypoints[inds.astype(np.int16)]
+        self.reference = reference
+        return reference, inds
+    
+    def get_refernece_traj_v(self, state, steps=10, waypoints=None, DT=0.05):
+        if waypoints is None:
+            waypoints = self.waypoints
+        _, dist, _, _, ind = nearest_point(np.array([state[0], state[1]]), 
+                                           waypoints[:, (0, 1)].copy())
+        travel = state[3] * DT * steps
+        _, dist, _, _, ind_future = nearest_point(np.array([state[0] + travel * np.cos(state[4]), 
+                                                     state[1] + travel * np.sin(state[4])]), 
+                                           waypoints[:, (0, 1)].copy())
+        if ind_future < ind:
+            ind_future += waypoints.shape[0]
+        interval = (ind_future - ind) // 10
+        # print('ind_future', ind, ind_future, interval)
+        inds = np.arange(ind, ind + interval * steps + 1, interval)
+        inds[np.where(inds >= waypoints.shape[0])] -= waypoints.shape[0]
+        reference = waypoints[inds.astype(np.int16)]
+        self.reference = reference
+        return reference, inds
     
     def get_refernece_traj(self, state, target_speed=None, vind=5, speed_factor=1.0):
         _, dist, _, _, ind = nearest_point(np.array([state[0], state[1]]), 
@@ -520,77 +486,29 @@ class MPPIEnv():
         
         if target_speed is None:
             # speed = self.waypoints[ind, vind] * speed_factor
-            speed = np.minimum(self.waypoints[ind, vind] * speed_factor, 20.)
-            # speed = state[3]
+            # speed = np.minimum(self.waypoints[ind, vind] * speed_factor, 20.)
+            speed = state[3]
         else:
             speed = target_speed
         
         # if ind < self.waypoints.shape[0] - self.n_steps:
         #     speeds = self.waypoints[ind:ind+self.n_steps, vind]
         # else:
+        print('speed', speed)
         speeds = np.ones(self.n_steps) * speed
         
-        reference = self.get_reference_trajectory(speeds, dist, ind, 
+        reference = get_reference_trajectory(speeds, dist, ind, 
                                             self.waypoints.copy(), int(self.n_steps),
                                             self.waypoints_distances.copy(), DT=self.DT)
         orientation = state[4]
-        angle_thres = 5.0
-        reference[3, :][reference[3, :] - orientation > angle_thres] = np.abs(
-            reference[3, :][reference[3, :] - orientation > angle_thres] - (2 * np.pi))
-        reference[3, :][reference[3, :] - orientation < -angle_thres] = np.abs(
-            reference[3, :][reference[3, :] - orientation < -angle_thres] + (2 * np.pi))
+        reference[3, :][reference[3, :] - orientation > 5] = np.abs(
+            reference[3, :][reference[3, :] - orientation > 5] - (2 * np.pi))
+        reference[3, :][reference[3, :] - orientation < -5] = np.abs(
+            reference[3, :][reference[3, :] - orientation < -5] + (2 * np.pi))
         
         # reference[2] = np.where(reference[2] - speed > 5.0, speed + 5.0, reference[2])
         self.reference = reference.T
         return reference.T, ind
-    
-    def get_reference_trajectory(self, predicted_speeds, dist_from_segment_start, idx, 
-                                waypoints, n_steps, waypoints_distances, DT):
-        s_relative = np.zeros((n_steps + 1,))
-        s_relative[0] = dist_from_segment_start
-        s_relative[1:] = predicted_speeds * DT
-        s_relative = np.cumsum(s_relative)
-
-        waypoints_distances_relative = np.cumsum(np.roll(waypoints_distances, -idx))
-
-        index_relative = np.int_(np.ones((n_steps + 1,)))
-        for i in range(n_steps + 1):
-            index_relative[i] = (waypoints_distances_relative <= s_relative[i]).sum()
-        index_absolute = np.mod(idx + index_relative, waypoints.shape[0] - 1)
-
-        segment_part = s_relative - (
-                waypoints_distances_relative[index_relative] - waypoints_distances[index_absolute])
-
-        t = (segment_part / waypoints_distances[index_absolute])
-        # print(np.all(np.logical_and((t < 1.0), (t > 0.0))))
-
-        position_diffs = (waypoints[np.mod(index_absolute + 1, waypoints.shape[0] - 1)][:, (1, 2)] -
-                            waypoints[index_absolute][:, (1, 2)])
-        orientation_diffs = (waypoints[np.mod(index_absolute + 1, waypoints.shape[0] - 1)][:, 3] -
-                                waypoints[index_absolute][:, 3])
-        speed_diffs = (waypoints[np.mod(index_absolute + 1, waypoints.shape[0] - 1)][:, 5] -
-                        waypoints[index_absolute][:, 5])
-
-        interpolated_positions = waypoints[index_absolute][:, (1, 2)] + (t * position_diffs.T).T
-        interpolated_orientations = waypoints[index_absolute][:, 3] + (t * orientation_diffs)
-        interpolated_orientations = (interpolated_orientations + np.pi) % (2 * np.pi) - np.pi
-        interpolated_speeds = waypoints[index_absolute][:, 5] + (t * speed_diffs)
-        
-        reference = np.array([
-            # Sort reference trajectory so the order of reference match the order of the states
-            interpolated_positions[:, 0],
-            interpolated_positions[:, 1],
-            interpolated_speeds,
-            interpolated_orientations,
-            # Fill zeros to the rest so number of references mathc number of states (x[k] - ref[k])
-            np.zeros(len(interpolated_speeds)),
-            np.zeros(len(interpolated_speeds)),
-            np.zeros(len(interpolated_speeds))
-        ])
-        return reference
-
-
-
 
 class MPPIPlanner():
     
@@ -604,65 +522,39 @@ class MPPIPlanner():
     ):
         self.track = track
         self.debug = debug
-        self.n_steps = 10
-        # self.n_samples = 1024
+        self.n_steps = 8
         self.n_samples = 128
         self.jRNG = oneLineJaxRNG(1337)
         self.DT = 0.1
-
+        
         self.config = Config()
         self.config.load_file("../../f1tenth_planning/control/kinematic_mppi/config.yaml")
 
         self.normalization_param = np.array(self.config.normalization_param).T
 
-        self.mppi_env_ks = MPPIEnv(self.track, self.n_steps, mode = 'ks', DT= self.DT, env_config=env_config, norm_param=self.normalization_param[0, 7:9]/2)
-        self.mppi_env_st = MPPIEnv(self.track, self.n_steps, mode = 'st', DT= self.DT, env_config=env_config, norm_param=self.normalization_param[0, 7:9]/2)
+        # print(self.config.normalization_param.shape)
+        self.mppi_env_ks = MPPIEnv(self.track, self.config.n_steps, self.normalization_param, mode='ks', DT=self.config.sim_time_step, env_config=env_config)
 
-        self.mppi = MPPI(self.config,jRNG=self.jRNG, a_noise = 1.0, scan = False)
+        self.mppi_env_st = MPPIEnv(self.track, self.config.n_steps, self.normalization_param, mode='st', DT=self.config.sim_time_step, env_config=env_config)
         
-        self.a_opt = None
-        self.a_cov = None
-        self.mppi_distrib = None
+        # self.mppi_env_st = MPPIEnv(self.track, self.n_steps, mode = 'st', DT= self.DT)
+        self.mppi_ks = MPPI(self.config, self.mppi_env_ks, self.jRNG) 
+        self.mppi_st = MPPI(self.config, self.mppi_env_st, self.jRNG) 
+
         
         self.mppi_path = None
         self.mppi_samples = None
-        self.target_vel = 5.0
-        # config_norm_params = self.normalization_param[0, 7:9]/2
+        self.target_vel = 3
+        config_norm_params = jnp.array(self.config.normalization_param[7:9])
 
-        self.norm_param = self.normalization_param[0, 7:9]/2
-        self.init_state()
+        self.norm_param = config_norm_params[:, 0]/2
+        # self.init_state()
         self.ref_path = None
         self.laptime = 0
 
-        self.init_mppi_compile()
-        
+        # self.init_mppi_compile()
+
     
-    def init_state(self):
-        self.mppi.init_state(self.mppi_env_ks.a_shape)
-        self.a_opt = self.mppi.a_opt
-        self.a_cov = self.mppi.a_cov
-
-        self.mppi_distrib = (self.a_opt, self.a_cov)
-    
-
-    def init_mppi_compile(self):
-
-
-        init_x = self.track.raceline.xs[0]
-        init_y = self.track.raceline.ys[0]
-        init_yaw = self.track.raceline.yaws[0]
-
-        state_ks = np.array([init_x, init_y, 0, 0, init_yaw], dtype=np.float32)
-
-        _,_ = self.mppi_env_ks.get_refernece_traj(state_ks, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
-        _, _, _= self.mppi.update(self.mppi_env_ks, state_ks.copy())
-        
-        
-        state_st = np.array([init_x, init_y, 0, 0, init_yaw, 0, 0], dtype=np.float32)
-
-        _,_ = self.mppi_env_st.get_refernece_traj(state_st, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
-        _, _, _= self.mppi.update(self.mppi_env_st, state_st.copy())
-
     def render_waypoints(self, e):
         """
         update waypoints being drawn by EnvRenderer
@@ -730,36 +622,45 @@ class MPPIPlanner():
         yawrate = obs['ang_vel_z']
         beta = obs['beta']
 
-        if v < 3.0:
+        
+        # print("hi2")
+        if v < 4.0:
+
             state = np.array([state_x, state_y, delta, v, yaw])
 
             ref_traj,_ = self.mppi_env_ks.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
             self.ref_path = ref_traj
-            self.mppi_distrib, sampled_traj, s_opt = self.mppi.update(self.mppi_env_ks, state.copy())
+            # print("hi")
+            self.mppi_ks.update(jnp.asarray(state), self.ref_path.copy())
+
+            self.mppi_path = self.mppi_ks.s_opt
+            self.mppi_samples = self.mppi_ks.sampled_states
+            a_opt = self.mppi_ks.a_opt[0]
+
+            
         
         else:
             state = np.array([state_x, state_y, delta, v, yaw, yawrate, beta])
 
             ref_traj,_ = self.mppi_env_st.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
             self.ref_path = ref_traj
-            # s_opt = None
-            self.mppi_distrib, sampled_traj, s_opt= self.mppi.update(self.mppi_env_st, state.copy())
+            # print("hi")
+            self.mppi_st.update(jnp.asarray(state), self.ref_path.copy())
 
-
-        self.mppi_path = s_opt
-        self.mppi_samples = sampled_traj[0]
-        # print(s_opt.shape
-
-        if self.debug:
-            # plots sampled trajectories every 40 steps
-            if(self.laptime %400 == 0):
-                for i in range(128):
-                    plt.plot(sampled_traj[0][i][:, 0], sampled_traj[0][i][:, 1])
-                plt.show()
+            self.mppi_path = self.mppi_st.s_opt
+            self.mppi_samples = self.mppi_st.sampled_states
+            a_opt = self.mppi_st.a_opt[0]
+              
+        # print(sampled_traj.shape)
+        # if(self.laptime %400 == 0):
+        #     for i in range(128):
+        #         plt.plot(sampled_traj[i][:, 0], sampled_traj[i][:, 1])
+        #     plt.show()
 
         self.laptime+=1
-        a_opt = self.mppi_distrib[0]
+        
         control = a_opt[0]
+
         scaled_control = np.multiply(self.norm_param, control)
 
         steerv = scaled_control[0]
@@ -771,8 +672,9 @@ class MPPIPlanner():
         # return sampled_traj
         # steer_angle = delta + steerv*self.DT
         # speed = v + accl*self.DT
+        print(steerv, accl)
         return steerv, accl
-
+        # return 0.0, 1.0
 
 @njit(cache=True)
 def nearest_point(point, trajectory):
@@ -805,3 +707,50 @@ def nearest_point(point, trajectory):
     dist_from_segment_start = np.linalg.norm(diffs[min_dist_segment] * t[min_dist_segment])
     return projections[min_dist_segment], dist_from_segment_start, dists[min_dist_segment], t[
         min_dist_segment], min_dist_segment
+
+
+# @njit(cache=True)
+def get_reference_trajectory(predicted_speeds, dist_from_segment_start, idx, 
+                             waypoints, n_steps, waypoints_distances, DT):
+    s_relative = np.zeros((n_steps + 1,))
+    s_relative[0] = dist_from_segment_start
+    s_relative[1:] = predicted_speeds * DT
+    s_relative = np.cumsum(s_relative)
+
+    waypoints_distances_relative = np.cumsum(np.roll(waypoints_distances, -idx))
+
+    index_relative = np.int_(np.ones((n_steps + 1,)))
+    for i in range(n_steps + 1):
+        index_relative[i] = (waypoints_distances_relative <= s_relative[i]).sum()
+    index_absolute = np.mod(idx + index_relative, waypoints.shape[0] - 1)
+
+    segment_part = s_relative - (
+            waypoints_distances_relative[index_relative] - waypoints_distances[index_absolute])
+
+    t = (segment_part / waypoints_distances[index_absolute])
+    # print(np.all(np.logical_and((t < 1.0), (t > 0.0))))
+
+    position_diffs = (waypoints[np.mod(index_absolute + 1, waypoints.shape[0] - 1)][:, (1, 2)] -
+                        waypoints[index_absolute][:, (1, 2)])
+    orientation_diffs = (waypoints[np.mod(index_absolute + 1, waypoints.shape[0] - 1)][:, 3] -
+                            waypoints[index_absolute][:, 3])
+    speed_diffs = (waypoints[np.mod(index_absolute + 1, waypoints.shape[0] - 1)][:, 5] -
+                    waypoints[index_absolute][:, 5])
+
+    interpolated_positions = waypoints[index_absolute][:, (1, 2)] + (t * position_diffs.T).T
+    interpolated_orientations = waypoints[index_absolute][:, 3] + (t * orientation_diffs)
+    interpolated_orientations = (interpolated_orientations + np.pi) % (2 * np.pi) - np.pi
+    interpolated_speeds = waypoints[index_absolute][:, 5] + (t * speed_diffs)
+    
+    reference = np.array([
+        # Sort reference trajectory so the order of reference match the order of the states
+        interpolated_positions[:, 0],
+        interpolated_positions[:, 1],
+        interpolated_speeds,
+        interpolated_orientations,
+        # Fill zeros to the rest so number of references mathc number of states (x[k] - ref[k])
+        np.zeros(len(interpolated_speeds)),
+        np.zeros(len(interpolated_speeds)),
+        np.zeros(len(interpolated_speeds))
+    ])
+    return reference
