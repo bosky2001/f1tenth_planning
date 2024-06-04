@@ -93,10 +93,12 @@ def main():
     # print("wypoints shape is " , waypoints.shape)
     laptime = 0.0
     start = time.time()
-
+    steerv_inputs = []
     while not done:
         plan_time = time.time()
         steerv, accl = planner.plan(obs["agent_0"])
+        steerv_inputs.append(steerv)
+
         print(1/(time.time() - plan_time))
             
         obs, timestep, terminated, truncated, infos = env.step(
@@ -111,7 +113,12 @@ def main():
                 obs["agent_0"]["linear_vel_x"], steerv, accl
             )
         )
-
+        if laptime > 60:
+            done = True
+        
+    plt.plot(planner.tracking_error)
+    # plt.plot(steerv_inputs)
+    plt.show()
     print("Sim elapsed time:", laptime, "Real elapsed time:", time.time() - start)
 
 

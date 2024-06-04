@@ -17,6 +17,8 @@ normalization_param:
 #   - -0.4
 - - 6.0 # 7 steering velocity
   - -3.0
+# - - 3.0 # 7 steering velocity
+#   - -1.5
 - - 7.0 # 8 acceleration
   - -3.5 
 # - - 2.0 # 8 acceleration

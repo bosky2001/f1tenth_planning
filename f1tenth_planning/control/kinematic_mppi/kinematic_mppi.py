@@ -96,42 +96,15 @@ class MPPI():
         # return (a_opt, a_cov)
     
 
-    @partial(jax.jit, static_argnums=(0, 1))
-    def iteration_step(self, env, a_opt, a_cov, rng_da, env_state, reference_traj):
-        self.a_opt = jnp.concatenate([self.a_opt[1:, :],
-                                jnp.expand_dims(jnp.zeros((self.a_shape,)),
-                                                axis=0)])  # [n_steps, a_shape]
-        if self.adaptive_covariance:
-            a_cov = jnp.concatenate([a_cov[1:, :],
-                                    jnp.expand_dims((self.a_std**2)*jnp.eye(self.a_shape),
-                                                    axis=0)])
-        
-        da = jax.random.truncated_normal(
-            rng_da,
-            -jnp.ones_like(a_opt) * self.a_std - a_opt,
-            jnp.ones_like(a_opt) * self.a_std - a_opt,
-            shape=(self.n_samples, self.n_steps, self.a_shape)
-        )  # [n_samples, n_steps, dim_a]
-
-        actions = jnp.clip(jnp.expand_dims(a_opt, axis=0) + da, -1.0, 1.0)
-        _, states = jax.vmap(self.rollout, in_axes=(0, None))(
-            actions, env_state
-        )
-        reward = jax.vmap(env.reward_fn, in_axes=(0, None))(
-            states, reference_traj
-        ) # [n_samples, n_steps]
-        
-        R = jax.vmap(self.returns)(reward) # [n_samples, n_steps], pylint: disable=invalid-name
-        w = jax.vmap(self.weights, 1, 1)(R)  # [n_samples, n_steps]
-        da_opt = jax.vmap(jnp.average, (1, None, 1))(da, 0, w)  # [n_steps, dim_a]
-        a_opt = jnp.clip(a_opt + da_opt, -1.0, 1.0)  # [n_steps, dim_a]
-        return a_opt, a_cov, states
-
 
     @partial(jax.jit, static_argnums=(0, 1))
     def get_a_opt(self, env, a_opt, reference, s, da):
-        r = jax.vmap(env.reward_fn, in_axes=(0, None))(
-                s, reference
+
+        actions = jnp.clip(jnp.expand_dims(a_opt, axis=0) + da, -1.0, 1.0)
+        # print(actions.shape)
+
+        r = jax.vmap(env.reward_fn, in_axes=(0, 0, None))(
+                s, actions, reference
             ) # [n_samples, n_steps]
             
         R = jax.vmap(self.returns)(r) # [n_samples, n_steps], pylint: disable=invalid-name
@@ -159,7 +132,7 @@ class MPPI():
 
     @partial(jax.jit, static_argnums=(0, 1))
     def iter_step(self, env, env_state, a_opt, a_cov, rng, reference_traj):
-        
+
         s, da= self.get_samples(env_state, a_opt, rng)
         # print(s.shape)
 
@@ -168,7 +141,7 @@ class MPPI():
 
         
         _, s_opt = self.rollout(a_opt, env_state)
-            
+        # s_opt = np.hstack((env_state, s_opt))
         return (a_opt, a_cov, s, s_opt)
 
     def update(self, env, env_state):
@@ -239,12 +212,6 @@ class MPPI():
    
         return reward, states
 
-
-
-
-
-
-
 class MPPIEnv():
     def __init__(self, track, n_steps, mode='st', DT=0.1, env_config=None, norm_param = None) -> None:
         self.a_shape = 2
@@ -255,10 +222,11 @@ class MPPIEnv():
             track.raceline.ys,
             track.raceline.yaws,
             track.raceline.ks,
-            track.raceline.vxs,
+            5.0*np.ones_like(track.raceline.vxs),
             track.raceline.axs
         ]
         self.waypoints = np.array(waypoints).T
+
         # self.frenet_coord = FrenetCoord(jnp.array(waypoints))
         # self.diff = self.waypoints[1:, 1:3] - self.waypoints[:-1, 1:3]
         self.waypoints_distances = np.linalg.norm(self.waypoints[1:, (1, 2)] - self.waypoints[:-1, (1, 2)], axis=1)
@@ -428,10 +396,7 @@ class MPPIEnv():
         return f
     
     def vehicle_dynamics_st(self, x, u_init):
-        """
-        Single Track Dynamic Vehicle Dynamics.
-
-            Args:
+        """track.raceline.vxs
                 x (numpy.ndarray (3, )): vehicle state vector (x1, x2, x3, x4, x5, x6, x7)
                     x1: x position in global coordinates
                     x2: y position in global coordinates
@@ -487,6 +452,29 @@ class MPPIEnv():
                 -mu/(x[3]*(lr+lf))*(C_Sr*(g*lf + u[1]*h) + C_Sf*(g*lr-u[1]*h))*x[6] \
                 +mu/(x[3]*(lr+lf))*(C_Sf*(g*lr-u[1]*h))*x[2]])
 
+        # if x[3] > 3.0:
+        #     # system dynamics
+        #     f = jnp.array([x[3]*jnp.cos(x[6] + x[4]),
+        #         x[3]*jnp.sin(x[6] + x[4]),
+        #         u[0],
+        #         u[1],
+        #         x[5],
+        #         -mu*m/(x[3]*I*(lr+lf))*(lf**2*C_Sf*(g*lr-u[1]*h) + lr**2*C_Sr*(g*lf + u[1]*h))*x[5] \
+        #             +mu*m/(I*(lr+lf))*(lr*C_Sr*(g*lf + u[1]*h) - lf*C_Sf*(g*lr - u[1]*h))*x[6] \
+        #             +mu*m/(I*(lr+lf))*lf*C_Sf*(g*lr - u[1]*h)*x[2],
+        #         (mu/(x[3]**2*(lr+lf))*(C_Sr*(g*lf + u[1]*h)*lr - C_Sf*(g*lr - u[1]*h)*lf)-1)*x[5] \
+        #             -mu/(x[3]*(lr+lf))*(C_Sr*(g*lf + u[1]*h) + C_Sf*(g*lr-u[1]*h))*x[6] \
+        #             +mu/(x[3]*(lr+lf))*(C_Sf*(g*lr-u[1]*h))*x[2]])
+        # else:
+        #     # system dynamics
+        #     f = jnp.array([x[3]*jnp.cos(x[6] + x[4]),
+        #         x[3]*jnp.sin(x[6] + x[4]),
+        #         u[0],
+        #         u[1],
+        #         x[5],
+        #         0,
+        #         0])
+
         return f
                 
     # @partial(jax.jit, static_argnums=(0,))
@@ -495,18 +483,30 @@ class MPPIEnv():
         # return self.update_fn(x, u)
     
     
-    @partial(jax.jit, static_argnums=(0,))
-    def reward_fn(self, s, reference):
+    # @partial(jax.jit, static_argnums=(0,))
+    def reward_fn(self, s, actions, reference):
+        
+        # print(actions.shape)
+        steerv = actions[:, 0]
+        accl = actions[:, 1]
+        steerv_cost = -jnp.square(steerv)
+        accl_cost = -jnp.square(accl)
+
+        # print(accl_cost.shape)
+
+
         
 
-        xy_cost = -jnp.linalg.norm(reference[1:, :2] - s[:, :2], ord=1, axis=1)
-        # vel_cost = -jnp.linalg.norm(reference[1:, 5] - s[:, 3])
+        xy_cost = -jnp.linalg.norm(reference[1:, :2] - s[:, :2], ord=1, axis=1)  #[n_steps]
+        vel_cost = -jnp.linalg.norm(reference[1:, 2] - s[:, 3])  #[n_steps]
         yaw_cost = -jnp.abs(jnp.sin(reference[1:, 3]) - jnp.sin(s[:, 4])) - \
-            jnp.abs(jnp.cos(reference[1:, 3]) - jnp.cos(s[:, 4]))
+            jnp.abs(jnp.cos(reference[1:, 3]) - jnp.cos(s[:, 4]))      #[n_steps]
         
         # adding terminal cost( useful sometimes)
         terminal_cost = -jnp.linalg.norm(reference[-1, :2] - s[-1, :2])
-        return xy_cost
+
+        return 3*xy_cost + 0.8*vel_cost + 10*yaw_cost  + 2*steerv_cost + 0.1*accl_cost
+    # return 3*xy_cost + 0.8*vel_cost + 10*yaw_cost  + 0.5*steerv_cost + 0.1*accl_cost
         return 15*xy_cost + 20*yaw_cost  
             
     
@@ -518,6 +518,8 @@ class MPPIEnv():
         _, dist, _, _, ind = nearest_point(np.array([state[0], state[1]]), 
                                            self.waypoints[:, (1, 2)].copy())
         
+        curr_speed = state[3]
+
         if target_speed is None:
             # speed = self.waypoints[ind, vind] * speed_factor
             speed = np.minimum(self.waypoints[ind, vind] * speed_factor, 20.)
@@ -528,11 +530,19 @@ class MPPIEnv():
         # if ind < self.waypoints.shape[0] - self.n_steps:
         #     speeds = self.waypoints[ind:ind+self.n_steps, vind]
         # else:
-        speeds = np.ones(self.n_steps) * speed
+        # speeds = np.ones(self.n_steps) * speed
+
+        if curr_speed < target_speed:
+            speeds = np.arange(curr_speed, speed, self.n_steps)
+        
+        else :
+            speeds = np.arange(speed, curr_speed, self.n_steps)
         
         reference = self.get_reference_trajectory(speeds, dist, ind, 
                                             self.waypoints.copy(), int(self.n_steps),
                                             self.waypoints_distances.copy(), DT=self.DT)
+        
+        # print(reference.T)
         orientation = state[4]
         angle_thres = 5.0
         reference[3, :][reference[3, :] - orientation > angle_thres] = np.abs(
@@ -543,6 +553,7 @@ class MPPIEnv():
         # reference[2] = np.where(reference[2] - speed > 5.0, speed + 5.0, reference[2])
         self.reference = reference.T
         return reference.T, ind
+    
     
     def get_reference_trajectory(self, predicted_speeds, dist_from_segment_start, idx, 
                                 waypoints, n_steps, waypoints_distances, DT):
@@ -589,9 +600,6 @@ class MPPIEnv():
         ])
         return reference
 
-
-
-
 class MPPIPlanner():
     
 
@@ -635,6 +643,7 @@ class MPPIPlanner():
         self.laptime = 0
 
         self.init_mppi_compile()
+        self.tracking_error = []
         
     
     def init_state(self):
@@ -676,6 +685,7 @@ class MPPIPlanner():
             self.track.raceline.vxs,
             self.track.raceline.axs
         ]
+
         waypoints = np.array(waypoints)
         points = np.array(waypoints).T[:, 1:3]
         e.render_closed_lines(points, color=(128, 0, 0), size=1)
@@ -735,27 +745,33 @@ class MPPIPlanner():
 
             ref_traj,_ = self.mppi_env_ks.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
             self.ref_path = ref_traj
+
+            
             self.mppi_distrib, sampled_traj, s_opt = self.mppi.update(self.mppi_env_ks, state.copy())
+            self.mppi_path = np.vstack((state.reshape((1, 5)), s_opt))
         
         else:
             state = np.array([state_x, state_y, delta, v, yaw, yawrate, beta])
 
-            ref_traj,_ = self.mppi_env_st.get_refernece_traj(state, target_speed = self.target_vel,  vind = 5, speed_factor= 1)
+            ref_traj,_ = self.mppi_env_st.get_refernece_traj(state, target_speed = self.target_vel, vind = 5, speed_factor= 1)
             self.ref_path = ref_traj
             # s_opt = None
             self.mppi_distrib, sampled_traj, s_opt= self.mppi.update(self.mppi_env_st, state.copy())
+            self.mppi_path = np.vstack((state.reshape((1, 7)), s_opt))
 
+        # print(ref_traj)
 
-        self.mppi_path = s_opt
+        
+        self.tracking_error.append( np.sum(np.square(ref_traj[0][:2] - self.mppi_path[0][:2])) )
         self.mppi_samples = sampled_traj[0]
         # print(s_opt.shape
 
-        if self.debug:
-            # plots sampled trajectories every 40 steps
-            if(self.laptime %400 == 0):
-                for i in range(128):
-                    plt.plot(sampled_traj[0][i][:, 0], sampled_traj[0][i][:, 1])
-                plt.show()
+        # if self.debug:
+        #     # plots sampled trajectories every 40 steps
+        #     if(self.laptime %400 == 0):
+        #         for i in range(128):
+        #             plt.plot(sampled_traj[0][i][:, 0], sampled_traj[0][i][:, 1])
+        #         plt.show()
 
         self.laptime+=1
         a_opt = self.mppi_distrib[0]
